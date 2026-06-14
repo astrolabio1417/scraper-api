@@ -10,8 +10,7 @@ COPY requirements.txt .
 
 # Copy and install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir flask "scrapling[all]"  && \
-    pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
 RUN playwright install chromium --with-deps
 

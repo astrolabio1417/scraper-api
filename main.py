@@ -1,20 +1,21 @@
 import json
 import os
-import queue
 import threading
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-from flask import Flask, jsonify, request
+import requests as req
+from flask import Flask, jsonify, request, Response, stream_with_context
 from scrapling.fetchers import FetcherSession, StealthySession
 
 app = Flask(__name__)
 
-_task_queue = queue.Queue()
 _session_store = {
-    "cookies": {},
-    "headers": {},
+    "sessions": {},  # { "domain": { "cookies": {}, "headers": {} } }
     "lock": threading.Lock(),
 }
+
+_stealth_locks = {}
+_stealth_locks_lock = threading.Lock()
 
 CLOUDFLARE_STATUS_CODES = {403, 503}
 CLOUDFLARE_DOM_MARKERS = [
@@ -26,53 +27,20 @@ CLOUDFLARE_DOM_MARKERS = [
 ]
 
 
-def _stealth_worker():
-    print("Stealth worker ready.")
-    while True:
-        task = _task_queue.get()
-        if task is None:
-            break
+def _get_domain(url):
+    return urlparse(url).netloc
 
-        url, fetch_kwargs, reply = task
 
-        try:
-            print(f"[stealth] Launching browser for: {url}")
-            with StealthySession(headless=True, solve_cloudflare=True) as browser:
-                page = browser.fetch(url, stealthy_headers=True, **fetch_kwargs)
+def _get_root_url(url):
+    parsed = urlparse(url)
+    return f"{parsed.scheme}://{parsed.netloc}/"
 
-                cookies = {}
-                if page.cookies:
-                    cookies = {c["name"]: str(c["value"]) for c in page.cookies}
 
-                with _session_store["lock"]:
-                    _session_store["cookies"] = cookies
-                    _session_store["headers"] = page.request_headers
-
-                body = page.body
-
-                if isinstance(body, bytes):
-                    body = body.decode("utf-8", errors="ignore")
-
-                parsed, is_json = _try_parse_json(body)
-
-                reply.put(
-                    (
-                        {
-                            "success": True,
-                            "status_code": getattr(page, "status", 200),
-                            "url": page.url,
-                            "is_json": is_json,
-                            "data": parsed if is_json else body,
-                        },
-                        200,
-                    )
-                )
-
-        except Exception as exc:
-            print(f"[stealth] Error: {exc}")
-            reply.put(({"success": False, "error": str(exc)}, 500))
-        finally:
-            _task_queue.task_done()
+def _get_stealth_lock(domain):
+    with _stealth_locks_lock:
+        if domain not in _stealth_locks:
+            _stealth_locks[domain] = threading.Lock()
+        return _stealth_locks[domain]
 
 
 def _try_parse_json(text):
@@ -97,13 +65,63 @@ def _is_blocked(status_code, body):
     return any(marker in lower for marker in CLOUDFLARE_DOM_MARKERS)
 
 
+def _get_session(domain):
+    with _session_store["lock"]:
+        session = _session_store["sessions"].get(domain, {})
+        return session.get("headers", {}).copy(), session.get("cookies", {}).copy()
+
+
+def _clear_session(domain):
+    with _session_store["lock"]:
+        _session_store["sessions"].pop(domain, None)
+
+
+def _run_stealth(url, extra_headers=None):
+    """Run stealth on the domain root to harvest valid cookies."""
+    domain = _get_domain(url)
+    root_url = _get_root_url(url)
+
+    print(f"[stealth] Starting stealth run for {domain} via {root_url}.")
+    with StealthySession(headless=True, solve_cloudflare=True) as browser:
+        kwargs = {}
+        if extra_headers:
+            kwargs["headers"] = extra_headers
+
+        page = browser.fetch(root_url, stealthy_headers=True, **kwargs)
+
+        cookies = {}
+        if page.cookies:
+            cookies = {c["name"]: str(c["value"]) for c in page.cookies}
+
+        with _session_store["lock"]:
+            _session_store["sessions"][domain] = {
+                "cookies": cookies,
+                "headers": page.request_headers,
+            }
+        print(f"[stealth] Session stored for {domain}.")
+
+
 def _fetch_via_stealth(url, extra_headers=None):
-    reply = queue.Queue()
-    kwargs = {}
-    if extra_headers:
-        kwargs["headers"] = extra_headers
-    _task_queue.put((url, kwargs, reply))
-    return reply.get()
+    """
+    Acquire per-domain lock and run stealth if no session exists yet.
+    If another thread already refreshed the session while waiting,
+    skip the run entirely.
+    """
+    domain = _get_domain(url)
+    lock = _get_stealth_lock(domain)
+
+    with lock:
+        _, cookies = _get_session(domain)
+        if cookies:
+            print(f"[stealth] {domain} session already ready, skipping run.")
+            return
+
+        _clear_session(domain)
+        try:
+            _run_stealth(url, extra_headers)
+        except Exception as exc:
+            print(f"[stealth] Error for {domain}: {exc}")
+            raise
 
 
 def _fetch_via_session(url, headers, cookies):
@@ -128,9 +146,42 @@ def _fetch_via_session(url, headers, cookies):
     }, 200
 
 
+def _stream_via_session(url, headers, cookies):
+    s = req.Session()
+    s.headers.update(headers)
+
+    r = s.get(url, cookies=cookies, stream=True, timeout=30)
+
+    first_chunk = next(r.iter_content(chunk_size=1024), b"")
+    preview = first_chunk.decode("utf-8", errors="ignore")
+
+    if _is_blocked(r.status_code, preview):
+        r.close()
+        return None
+
+    def generate():
+        yield first_chunk
+        for chunk in r.iter_content(chunk_size=8192):
+            if chunk:
+                yield chunk
+
+    content_type = r.headers.get("content-type", "application/octet-stream")
+    content_disposition = r.headers.get("content-disposition", "")
+
+    response = Response(
+        stream_with_context(generate()),
+        status=r.status_code,
+        content_type=content_type,
+    )
+    if content_disposition:
+        response.headers["Content-Disposition"] = content_disposition
+
+    return response
+
+
 @app.route("/api/fetch", methods=["POST"])
 def handle_fetch():
-    body = request.get_json() or {}
+    body = request.get_json(silent=True, force=True) or {}
     url = body.get("url")
 
     if not url:
@@ -139,11 +190,11 @@ def handle_fetch():
     if body.get("params") and isinstance(body["params"], dict):
         url = _build_url_with_params(url, body["params"])
 
-    with _session_store["lock"]:
-        cached_headers = _session_store["headers"].copy()
-        cached_cookies = _session_store["cookies"].copy()
-
+    domain = _get_domain(url)
     extra_headers = body.get("headers") or {}
+
+    # Attempt 1: existing session
+    cached_headers, cached_cookies = _get_session(domain)
     if extra_headers:
         cached_headers.update(extra_headers)
 
@@ -151,19 +202,93 @@ def handle_fetch():
         try:
             result, status = _fetch_via_session(url, cached_headers, cached_cookies)
             if result is not None:
-                print("[session] Request succeeded.")
+                print("[fetch] Session request succeeded.")
                 return jsonify(result), status
-            print("[session] Challenge detected, falling back to stealth.")
+            print("[fetch] Session blocked, refreshing via stealth.")
         except Exception as exc:
-            print(f"[session] Error: {exc}")
+            print(f"[fetch] Session error: {exc}")
 
-    result, status = _fetch_via_stealth(url, extra_headers or None)
-    return jsonify(result), status
+    # Attempt 2: stealth refresh, then retry session
+    try:
+        _fetch_via_stealth(url, extra_headers or None)
+    except Exception as exc:
+        return jsonify({"error": f"Stealth failed: {exc}"}), 502
+
+    cached_headers, cached_cookies = _get_session(domain)
+    if extra_headers:
+        cached_headers.update(extra_headers)
+
+    result, status = _fetch_via_session(url, cached_headers, cached_cookies)
+    if result is not None:
+        return jsonify(result), status
+
+    return jsonify({"error": "Failed to fetch after stealth refresh"}), 502
 
 
-_worker_thread = threading.Thread(target=_stealth_worker, daemon=True)
-_worker_thread.start()
+@app.route("/api/download", methods=["GET"])
+def handle_download():
+    url = request.args.get("url")
+
+    if not url:
+        return jsonify({"error": "Missing 'url' parameter"}), 400
+
+    params = request.args.to_dict()
+    params.pop("url", None)
+
+    if params:
+        url = _build_url_with_params(url, params)
+
+    domain = _get_domain(url)
+
+    # Attempt 1: existing session
+    cached_headers, cached_cookies = _get_session(domain)
+
+    if cached_cookies and cached_headers:
+        try:
+            result = _stream_via_session(url, cached_headers, cached_cookies)
+
+            if result is not None:
+                print("[download] Session stream succeeded.")
+                return result
+
+            print("[download] Session blocked, refreshing via stealth.")
+        except Exception as exc:
+            print(f"[download] Session error: {exc}")
+
+    # Attempt 2: stealth refresh, then retry stream
+    try:
+        _fetch_via_stealth(url)
+    except Exception as exc:
+        return jsonify({"error": f"Stealth failed: {exc}"}), 502
+
+    cached_headers, cached_cookies = _get_session(domain)
+
+    try:
+        result = _stream_via_session(url, cached_headers, cached_cookies)
+
+        if result is not None:
+            print("[download] Session stream succeeded after stealth refresh.")
+            return result
+    except Exception as exc:
+        print(f"[download] Final stream error: {exc}")
+
+    return jsonify({"error": "Failed to download after stealth refresh"}), 502
+
+
+@app.route("/api/session", methods=["GET"])
+def handle_session():
+    domain = request.args.get("domain")
+    with _session_store["lock"]:
+        if domain:
+            session = _session_store["sessions"].get(domain)
+            if not session:
+                return jsonify({"error": f"No session for {domain}"}), 404
+            return jsonify(session), 200
+        if not _session_store["sessions"]:
+            return jsonify({"error": "No sessions available yet"}), 404
+        return jsonify(_session_store["sessions"]), 200
+
 
 if __name__ == "__main__":
     debug = os.environ.get("FLASK_DEBUG") == "1"
-    app.run(host="0.0.0.0", port=5001, debug=debug)
+    app.run(host="0.0.0.0", port=5001, debug=debug, threaded=True)
