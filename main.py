@@ -17,6 +17,10 @@ _session_store = {
 _stealth_locks = {}
 _stealth_locks_lock = threading.Lock()
 
+# Per-domain: True = plain requests work (no Cloudflare), False = needs session/stealth
+_domain_status = {}
+_domain_status_lock = threading.Lock()
+
 CLOUDFLARE_STATUS_CODES = {403, 503}
 CLOUDFLARE_DOM_MARKERS = [
     "<title>just a moment...</title>",
@@ -41,6 +45,17 @@ def _get_stealth_lock(domain):
         if domain not in _stealth_locks:
             _stealth_locks[domain] = threading.Lock()
         return _stealth_locks[domain]
+
+
+def _get_domain_status(domain):
+    """Returns True (plain works), False (needs stealth), or None (unknown)."""
+    with _domain_status_lock:
+        return _domain_status.get(domain)
+
+
+def _set_domain_status(domain, plain_works):
+    with _domain_status_lock:
+        _domain_status[domain] = plain_works
 
 
 def _try_parse_json(text):
@@ -93,10 +108,15 @@ def _run_stealth(url, extra_headers=None):
         if page.cookies:
             cookies = {c["name"]: str(c["value"]) for c in page.cookies}
 
+        # Strip HTTP/2 pseudo-headers (:authority, :method, etc.) — invalid for requests
+        headers = {
+            k: v for k, v in page.request_headers.items() if not k.startswith(":")
+        }
+
         with _session_store["lock"]:
             _session_store["sessions"][domain] = {
                 "cookies": cookies,
-                "headers": page.request_headers,
+                "headers": headers,
             }
         print(f"[stealth] Session stored for {domain}.")
 
@@ -179,6 +199,21 @@ def _stream_via_session(url, headers, cookies):
     return response
 
 
+def _should_try_plain(domain, has_session):
+    """
+    Decide whether to attempt a plain session request before stealth.
+    - Unknown domain (never seen): always try plain first.
+    - Known to work plain: keep trying plain.
+    - Known to need stealth: only try if we have cached cookies.
+    """
+    status = _get_domain_status(domain)
+    if status is None:
+        return True
+    if status is True:
+        return True
+    return has_session
+
+
 @app.route("/api/fetch", methods=["POST"])
 def handle_fetch():
     body = request.get_json(silent=True, force=True) or {}
@@ -193,22 +228,23 @@ def handle_fetch():
     domain = _get_domain(url)
     extra_headers = body.get("headers") or {}
 
-    # Attempt 1: existing session
     cached_headers, cached_cookies = _get_session(domain)
     if extra_headers:
         cached_headers.update(extra_headers)
 
-    if cached_cookies and cached_headers:
+    if _should_try_plain(domain, bool(cached_cookies and cached_headers)):
         try:
             result, status = _fetch_via_session(url, cached_headers, cached_cookies)
             if result is not None:
                 print("[fetch] Session request succeeded.")
+                _set_domain_status(domain, not (cached_cookies and cached_headers))
                 return jsonify(result), status
             print("[fetch] Session blocked, refreshing via stealth.")
         except Exception as exc:
             print(f"[fetch] Session error: {exc}")
 
-    # Attempt 2: stealth refresh, then retry session
+    _set_domain_status(domain, False)
+
     try:
         _fetch_via_stealth(url, extra_headers or None)
     except Exception as exc:
@@ -234,28 +270,26 @@ def handle_download():
 
     params = request.args.to_dict()
     params.pop("url", None)
-
     if params:
         url = _build_url_with_params(url, params)
 
     domain = _get_domain(url)
 
-    # Attempt 1: existing session
     cached_headers, cached_cookies = _get_session(domain)
 
-    if cached_cookies and cached_headers:
+    if _should_try_plain(domain, bool(cached_cookies and cached_headers)):
         try:
             result = _stream_via_session(url, cached_headers, cached_cookies)
-
             if result is not None:
                 print("[download] Session stream succeeded.")
+                _set_domain_status(domain, not (cached_cookies and cached_cookies))
                 return result
-
             print("[download] Session blocked, refreshing via stealth.")
         except Exception as exc:
             print(f"[download] Session error: {exc}")
 
-    # Attempt 2: stealth refresh, then retry stream
+    _set_domain_status(domain, False)
+
     try:
         _fetch_via_stealth(url)
     except Exception as exc:
@@ -265,7 +299,6 @@ def handle_download():
 
     try:
         result = _stream_via_session(url, cached_headers, cached_cookies)
-
         if result is not None:
             print("[download] Session stream succeeded after stealth refresh.")
             return result
