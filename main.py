@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request, Response, stream_with_context
 from scrapling.fetchers import FetcherSession, StealthySession
 
 app = Flask(__name__)
+proxy = os.environ.get("proxy")
 
 _session_store = {
     "sessions": {},  # { "domain": { "cookies": {}, "headers": {} } }
@@ -97,7 +98,7 @@ def _run_stealth(url, extra_headers=None):
     root_url = _get_root_url(url)
 
     print(f"[stealth] Starting stealth run for {domain} via {root_url}.")
-    with StealthySession(headless=True, solve_cloudflare=True) as browser:
+    with StealthySession(headless=True, solve_cloudflare=True, proxy=proxy) as browser:
         kwargs = {}
         if extra_headers:
             kwargs["headers"] = extra_headers
