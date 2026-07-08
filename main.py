@@ -147,7 +147,7 @@ def _fetch_via_stealth(url, extra_headers=None):
 
 def _fetch_via_session(url, headers, cookies):
     print("[session] Attempting light HTTP request...")
-    with FetcherSession(impersonate="chrome", headers=headers) as session:
+    with FetcherSession(impersonate="chrome", headers=headers, proxy=proxy) as session:
         page = session.get(url, stealthy_headers=True, cookies=cookies)
 
     body = page.body
