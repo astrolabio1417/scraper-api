@@ -33,8 +33,7 @@ _domain_status = {}
 _stealth_failures = {}
 _domain_status_lock = threading.Lock()
 
-# How long to stop launching browsers at a domain after stealth failed to help.
-# Without this, a domain that hard-blocks costs a browser launch on every request.
+# After stealth fails to unblock a domain, stop launching browsers at it for this long.
 STEALTH_COOLDOWN_S = int(os.environ.get("STEALTH_COOLDOWN_S", "900"))
 
 # Caps how long a browser run waits for the challenge to clear.
@@ -42,8 +41,7 @@ STEALTH_TIMEOUT_MS = int(os.environ.get("STEALTH_TIMEOUT_MS", "30000"))
 
 # 503 is Cloudflare's classic interstitial — always worth a stealth run.
 CLOUDFLARE_STATUS_CODES = {503}
-# 403 is ambiguous: Cloudflare uses it, but so does every plain auth denial.
-# A 403 escalates only when the body carries one of these challenge markers.
+# A 403 alone is just an auth denial; it escalates only with one of these markers.
 CLOUDFLARE_DOM_MARKERS = [
     "<title>just a moment...</title>",
     'id="cf-challenge-form"',
@@ -65,8 +63,7 @@ def _get_status_key(url):
     """
     host = (urlparse(url).hostname or "").lower()
     labels = host.split(".")
-    # An IPv4 literal has no registrable domain — grouping 192.168.1.10 down to
-    # "1.10" would collide with any other address sharing those last two octets.
+    # IPv4 literals have no registrable domain; grouping by last two octets would collide.
     if len(labels) <= 2 or host.replace(".", "").isdigit():
         return host
     # ponytail: naive last-two-labels rule. For co.uk-style suffixes this just
@@ -164,10 +161,8 @@ def _run_stealth(url, use_root=True):
     """
     Solve the challenge in Camoufox and store its cookies plus user agent.
 
-    Chromium-based browsers no longer pass interactive Turnstile; Camoufox does,
-    headless, without clicking, but only with geoip so locale and timezone match
-    the egress IP. The cookie is bound to the browser's user agent,
-    so that UA is stored with it and must be sent on every light request.
+    geoip=True is required: Turnstile fails when locale/timezone don't match the
+    egress IP. The UA is stored because cf_clearance is bound to it.
     """
     domain = _get_domain(url)
     root_url = _get_root_url(url) if use_root else url
@@ -191,7 +186,6 @@ def _run_stealth(url, use_root=True):
             time.sleep(1)
 
         if challenged():
-            # Cookies from an unsolved challenge page are useless; don't cache them.
             raise RuntimeError(f"challenge still present on {root_url}")
 
         cookies = {c["name"]: str(c["value"]) for c in page.context.cookies()}
@@ -300,19 +294,8 @@ def _stream_via_session(url, headers, cookies):
 
 
 def _should_try_plain(key, has_session):
-    """
-    Decide whether to attempt a plain session request before stealth.
-    `key` is a _get_status_key value, not a host.
-    - Unknown domain (never seen): always try plain first.
-    - Known to work plain: keep trying plain.
-    - Known to need stealth: only try if we have cached cookies.
-    """
-    status = _get_domain_status(key)
-    if status is None:
-        return True
-    if status is True:
-        return True
-    return has_session
+    """Domains known to need stealth only get a plain attempt when cookies are cached."""
+    return _get_domain_status(key) is not False or has_session
 
 
 def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, tag=""):
@@ -355,7 +338,7 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
         value, _ = try_attempt("plain")
         if value is not None:
             log.info("[%s] Succeeded without stealth.", tag)
-            # Clean only if it worked with no cached session helping it along.
+            # Only a success without cached cookies proves the domain works plain.
             _set_domain_status(key, not used_cached_session)
             return value, None
 
@@ -382,7 +365,7 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
             log.info("[%s] Skipping target-URL stealth (%s).", tag, content_type)
             break
 
-    # Stealth ran and still couldn't get through — stop launching browsers here.
+    # Stealth couldn't get through; cool down to stop relaunching browsers.
     _mark_stealth_failed(key)
     return None, "Failed after stealth refresh"
 
