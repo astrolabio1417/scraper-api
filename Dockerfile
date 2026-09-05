@@ -12,7 +12,7 @@ COPY requirements.txt .
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN playwright install chromium --with-deps
+RUN playwright install-deps firefox && python -m camoufox fetch
 
 # Copy the rest of your scraper source code
 COPY . .
