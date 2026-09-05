@@ -224,8 +224,10 @@ def _light_session(headers, cookies):
     Impersonate Firefox so the TLS fingerprint matches the Camoufox UA and cookie;
     Cloudflare fingerprints TLS, and a Chrome handshake under a Firefox UA stands out.
     """
+    # socks5h resolves DNS at the proxy, matching Firefox; socks5 resolves locally and fails.
+    curl_proxy = proxy.replace("socks5://", "socks5h://", 1) if proxy else None
     return curl.Session(
-        impersonate="firefox", headers=headers, cookies=cookies, proxy=proxy, timeout=30
+        impersonate="firefox", headers=headers, cookies=cookies, proxy=curl_proxy, timeout=30
     )
 
 
