@@ -36,8 +36,7 @@ _domain_status_lock = threading.Lock()
 # After stealth fails to unblock a domain, stop launching browsers at it for this long.
 STEALTH_COOLDOWN_S = int(os.environ.get("STEALTH_COOLDOWN_S", "900"))
 
-# Caps how long a browser run waits for the challenge to clear.
-STEALTH_TIMEOUT_MS = int(os.environ.get("STEALTH_TIMEOUT_MS", "30000"))
+CHALLENGE_WAIT_S = int(os.environ.get("CHALLENGE_WAIT_S", "30"))
 
 # 503 is Cloudflare's classic interstitial — always worth a stealth run.
 CLOUDFLARE_STATUS_CODES = {503}
@@ -181,7 +180,7 @@ def _run_stealth(url, use_root=True):
                 # page.content() raises while the challenge redirects; still blocked.
                 return True
 
-        deadline = time.monotonic() + STEALTH_TIMEOUT_MS / 1000
+        deadline = time.monotonic() + CHALLENGE_WAIT_S
         while challenged() and time.monotonic() < deadline:
             time.sleep(1)
 
@@ -222,8 +221,8 @@ def _fetch_via_stealth(url, use_root=True):
 
 def _light_session(headers, cookies):
     """
-    Impersonate Firefox at the TLS layer to match the Camoufox-solved cookie;
-    Cloudflare can bind cf_clearance to the TLS fingerprint as well as the UA.
+    Impersonate Firefox so the TLS fingerprint matches the Camoufox UA and cookie;
+    Cloudflare fingerprints TLS, and a Chrome handshake under a Firefox UA stands out.
     """
     return curl.Session(
         impersonate="firefox", headers=headers, cookies=cookies, proxy=proxy, timeout=30
@@ -261,8 +260,6 @@ def _stream_via_session(url, headers, cookies):
 
     content_type = r.headers.get("content-type", "application/octet-stream")
 
-    # One iterator for the whole body: a second iter_content() call yields
-    # nothing, which would truncate the response to first_chunk.
     stream = r.iter_content(chunk_size=8192)
     first_chunk = next(stream, b"")
     preview = first_chunk.decode("utf-8", errors="ignore")
