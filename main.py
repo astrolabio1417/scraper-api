@@ -5,10 +5,9 @@ import threading
 import time
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-import requests as req
-from flask import Flask, jsonify, request, Response, stream_with_context
 from camoufox.sync_api import Camoufox
-from scrapling.fetchers import FetcherSession
+from curl_cffi import requests as curl
+from flask import Flask, jsonify, request, Response, stream_with_context
 
 app = Flask(__name__)
 proxy = os.environ.get("proxy")
@@ -227,37 +226,36 @@ def _fetch_via_stealth(url, use_root=True):
             raise
 
 
+def _light_session(headers, cookies):
+    """
+    Impersonate Firefox at the TLS layer to match the Camoufox-solved cookie;
+    Cloudflare can bind cf_clearance to the TLS fingerprint as well as the UA.
+    """
+    return curl.Session(
+        impersonate="firefox", headers=headers, cookies=cookies, proxy=proxy, timeout=30
+    )
+
+
 def _fetch_via_session(url, headers, cookies, method="GET", data=None, follow=True):
     """Returns (payload_or_None, content_type). None means blocked."""
     log.info("Attempting light %s request to %s", method, url)
-    with FetcherSession(impersonate="chrome", headers=headers, proxy=proxy) as session:
-        kwargs = {
-            "stealthy_headers": True,
-            "cookies": cookies,
-            "follow_redirects": follow,
-        }
-        if method == "POST":
-            page = session.post(url, data=data, **kwargs)
-        else:
-            page = session.get(url, **kwargs)
+    with _light_session(headers, cookies) as s:
+        r = s.request(method, url, data=data, allow_redirects=follow)
 
-    body = page.body
-    if isinstance(body, bytes):
-        body = body.decode("utf-8", errors="ignore")
+    body = r.content.decode("utf-8", errors="ignore")
+    resp_headers = dict(r.headers)
+    content_type = resp_headers.get("content-type", "")
 
-    resp_headers = dict(page.headers or {})
-    content_type = resp_headers.get("content-type", resp_headers.get("Content-Type", ""))
-
-    if _is_blocked(page.status, body):
+    if _is_blocked(r.status_code, body):
         return None, content_type
 
     parsed, is_json = _try_parse_json(body)
     return {
         "success": True,
-        "status_code": page.status,
+        "status_code": r.status_code,
         "url": url,
         "headers": resp_headers,
-        "location": resp_headers.get("location") or resp_headers.get("Location"),
+        "location": resp_headers.get("location"),
         "is_json": is_json,
         "data": parsed if is_json else body,
     }, content_type
@@ -265,12 +263,7 @@ def _fetch_via_session(url, headers, cookies, method="GET", data=None, follow=Tr
 
 def _stream_via_session(url, headers, cookies):
     """Returns (flask_response_or_None, content_type_of_the_response)."""
-    s = req.Session()
-    s.headers.update(headers)
-    if proxy:
-        s.proxies = {"http": proxy, "https": proxy}
-
-    r = s.get(url, cookies=cookies, stream=True, timeout=30)
+    r = _light_session(headers, cookies).get(url, stream=True)
 
     content_type = r.headers.get("content-type", "application/octet-stream")
 
@@ -285,11 +278,13 @@ def _stream_via_session(url, headers, cookies):
         return None, content_type
 
     def generate():
-        with r:  # closes the connection if the client disconnects mid-stream
+        try:
             yield first_chunk
             for chunk in stream:
                 if chunk:
                     yield chunk
+        finally:
+            r.close()  # also runs if the client disconnects mid-stream
 
     content_disposition = r.headers.get("content-disposition", "")
 
