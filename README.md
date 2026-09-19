@@ -8,15 +8,14 @@ Small Flask API that fetches pages through a normal HTTP session first and falls
 - `GET /api/download` for streaming a remote file or response body
 - `GET /api/session` for inspecting cached sessions by domain
 - Per-domain in-memory session cache for headers and cookies
-- Cloudflare-aware fallback using `scrapling` and Playwright Chromium
+- Cloudflare-aware fallback using Camoufox (stealth Firefox) and `curl_cffi` TLS impersonation
 
 ## Requirements
 
 - Python 3.12+
 - Flask
-- requests
-- scrapling with browser support
-- Playwright Chromium
+- curl_cffi
+- camoufox
 
 ## Run Locally
 
@@ -24,8 +23,7 @@ Install dependencies:
 
 ```bash
 pip install -r requirements.txt
-pip install flask requests "scrapling[all]"
-playwright install chromium
+python -m camoufox fetch
 ```
 
 Start the API:
@@ -68,7 +66,9 @@ Request body:
 {
     "url": "https://example.com/data",
     "params": { "page": 1 },
-    "headers": { "User-Agent": "MyClient/1.0" }
+    "headers": { "Referer": "https://example.com/" },
+    "method": "GET",
+    "follow_redirects": true
 }
 ```
 
@@ -108,8 +108,17 @@ Get one domain:
 curl "http://localhost:5001/api/session?domain=example.com"
 ```
 
+## Configuration
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `proxy` | unset | Proxy URL for both paths, e.g. `socks5://user:pass@host:1080` |
+| `STEALTH_COOLDOWN_S` | `900` | Seconds to stop launching browsers at a domain after stealth failed |
+| `CHALLENGE_WAIT_S` | `30` | Seconds to wait for a challenge to clear in the browser |
+| `LOG_LEVEL` | `INFO` | Python logging level |
+
 ## Notes
 
 - Session data is stored in memory only and is lost when the process restarts.
-- The stealth fallback may launch Chromium and take longer than a normal request.
+- The stealth fallback may launch a headless Firefox and take longer than a normal request.
 - The API is intended for scraping-friendly use cases where some targets require browser-based challenge solving.
