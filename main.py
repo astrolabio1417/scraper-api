@@ -3,6 +3,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from camoufox.sync_api import Camoufox
@@ -18,29 +19,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("scraper")
 
-_session_store = {
-    "sessions": {},  # { "domain": { "cookies": {}, "headers": {} } }
-    "lock": threading.Lock(),
-}
-
-_stealth_locks = {}
-_stealth_locks_lock = threading.Lock()
-
-# Keyed by _get_status_key, not by host.
-# _domain_status: True = plain requests work (no Cloudflare), False = needs stealth
-# _stealth_failures: when a stealth run last failed to unblock a domain
-_domain_status = {}
-_stealth_failures = {}
-_domain_status_lock = threading.Lock()
-
-# After stealth fails to unblock a domain, stop launching browsers at it for this long.
 STEALTH_COOLDOWN_S = int(os.environ.get("STEALTH_COOLDOWN_S", "900"))
-
 CHALLENGE_WAIT_S = int(os.environ.get("CHALLENGE_WAIT_S", "30"))
 
-# 503 is Cloudflare's classic interstitial — always worth a stealth run.
 CLOUDFLARE_STATUS_CODES = {503}
-# A 403 alone is just an auth denial; it escalates only with one of these markers.
 CLOUDFLARE_DOM_MARKERS = [
     "<title>just a moment...</title>",
     'id="cf-challenge-form"',
@@ -48,14 +30,31 @@ CLOUDFLARE_DOM_MARKERS = [
     'id="challenge-running"',
     'id="cf-please-wait"',
 ]
-
-# Cloudflare's JS-detection beacon. It ships with its 429 challenge, but it is
-# also injected into perfectly good 200 pages for fingerprinting, so on its own
-# it means nothing — only paired with an error status is it a real challenge.
+# Also injected into healthy 200 pages for fingerprinting; a challenge only with an error status.
 CLOUDFLARE_ERROR_DOM_MARKERS = [
     "/cdn-cgi/challenge-platform/",
     "__cf$cv$params",
 ]
+
+
+@dataclass
+class Domain:
+    """Cookies/headers live on the netloc record; the verdict on the status-key record."""
+
+    cookies: dict = field(default_factory=dict)
+    headers: dict = field(default_factory=dict)
+    plain_works: bool | None = None
+    stealth_failed_at: float | None = None
+    stealth_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+_domains: dict[str, Domain] = {}
+_lock = threading.Lock()
+
+
+def _domain(key):
+    with _lock:
+        return _domains.setdefault(key, Domain())
 
 
 def _get_domain(url):
@@ -63,63 +62,25 @@ def _get_domain(url):
 
 
 def _get_status_key(url):
-    """
-    Key for the per-domain verdict and cooldown — deliberately broader than the
-    cookie key, so sibling CDN hosts (vault-05/vault-06.example.net) share one
-    verdict instead of each relearning it with a browser launch.
-    """
+    """Registrable domain, so sibling CDN hosts share one verdict and cooldown."""
     host = (urlparse(url).hostname or "").lower()
     labels = host.split(".")
-    # IPv4 literals have no registrable domain; grouping by last two octets would collide.
     if len(labels) <= 2 or host.replace(".", "").isdigit():
         return host
-    # ponytail: naive last-two-labels rule. For co.uk-style suffixes this just
-    # yields a broader key (a shared verdict), never a wrong host match.
+    # ponytail: last two labels; co.uk-style suffixes yield a broader key, never a wrong one.
     return ".".join(labels[-2:])
 
 
-def _get_root_url(url):
-    parsed = urlparse(url)
-    return f"{parsed.scheme}://{parsed.netloc}/"
-
-
-def _get_stealth_lock(domain):
-    with _stealth_locks_lock:
-        if domain not in _stealth_locks:
-            _stealth_locks[domain] = threading.Lock()
-        return _stealth_locks[domain]
-
-
-def _get_domain_status(domain):
-    """Returns True (plain works), False (needs stealth), or None (unknown)."""
-    with _domain_status_lock:
-        return _domain_status.get(domain)
-
-
-def _set_domain_status(domain, plain_works):
-    with _domain_status_lock:
-        _domain_status[domain] = plain_works
-        if plain_works:
-            _stealth_failures.pop(domain, None)
-
-
 def _in_stealth_cooldown(key):
-    """True when stealth recently failed for this domain — don't launch a browser."""
-    with _domain_status_lock:
-        failed_at = _stealth_failures.get(key)
-    return failed_at is not None and (time.monotonic() - failed_at) < STEALTH_COOLDOWN_S
+    failed_at = _domain(key).stealth_failed_at
+    return failed_at is not None and time.monotonic() - failed_at < STEALTH_COOLDOWN_S
 
 
-def _mark_stealth_failed(key):
-    with _domain_status_lock:
-        _stealth_failures[key] = time.monotonic()
-
-
-def _try_parse_json(text):
-    try:
-        return json.loads(text), True
-    except (ValueError, TypeError):
-        return None, False
+def _set_domain_status(key, plain_works):
+    d = _domain(key)
+    d.plain_works = plain_works
+    if plain_works:
+        d.stealth_failed_at = None
 
 
 def _build_url_with_params(base_url, params):
@@ -131,34 +92,16 @@ def _build_url_with_params(base_url, params):
 
 
 def _is_blocked(status_code, body):
-    """
-    True when a stealth run could plausibly help: a 503 interstitial, or a body
-    carrying a challenge marker. A bare 403 is returned to the caller instead of
-    burning two browser launches on a plain authorization denial.
-    """
+    """A bare 403 is an auth denial, not a challenge; it escalates only with a marker."""
     lower = (body or "").lower()
-    if any(marker in lower for marker in CLOUDFLARE_DOM_MARKERS):
+    if any(m in lower for m in CLOUDFLARE_DOM_MARKERS):
         return True
-    if status_code >= 400 and any(
-        marker in lower for marker in CLOUDFLARE_ERROR_DOM_MARKERS
-    ):
+    if status_code >= 400 and any(m in lower for m in CLOUDFLARE_ERROR_DOM_MARKERS):
         return True
     return status_code in CLOUDFLARE_STATUS_CODES
 
 
-def _get_session(domain):
-    with _session_store["lock"]:
-        session = _session_store["sessions"].get(domain, {})
-        return session.get("headers", {}).copy(), session.get("cookies", {}).copy()
-
-
-def _clear_session(domain):
-    with _session_store["lock"]:
-        _session_store["sessions"].pop(domain, None)
-
-
 def _camoufox_proxy():
-    """Translate the proxy URL env into Playwright's proxy dict."""
     if not proxy:
         return None
     u = urlparse(proxy)
@@ -169,16 +112,12 @@ def _camoufox_proxy():
 
 
 def _run_stealth(url, use_root=True):
-    """
-    Solve the challenge in Camoufox and store its cookies plus user agent.
+    """geoip=True: Turnstile fails when locale/timezone mismatch the egress IP.
+    The UA is stored because cf_clearance is bound to it."""
+    parsed = urlparse(url)
+    root_url = f"{parsed.scheme}://{parsed.netloc}/" if use_root else url
 
-    geoip=True is required: Turnstile fails when locale/timezone don't match the
-    egress IP. The UA is stored because cf_clearance is bound to it.
-    """
-    domain = _get_domain(url)
-    root_url = _get_root_url(url) if use_root else url
-
-    log.info("[stealth] Starting run for %s via %s.", domain, root_url)
+    log.info("[stealth] Starting run for %s via %s.", parsed.netloc, root_url)
     with Camoufox(
         headless=True, humanize=True, os="windows", geoip=True, proxy=_camoufox_proxy()
     ) as browser:
@@ -188,61 +127,38 @@ def _run_stealth(url, use_root=True):
         def challenged():
             try:
                 return _is_blocked(200, page.content())
-            except Exception:
-                # page.content() raises while the challenge redirects; still blocked.
+            except Exception:  # page.content() raises mid-redirect
                 return True
 
         deadline = time.monotonic() + CHALLENGE_WAIT_S
         while challenged() and time.monotonic() < deadline:
             time.sleep(1)
-
         if challenged():
             raise RuntimeError(f"challenge still present on {root_url}")
 
         cookies = {c["name"]: str(c["value"]) for c in page.context.cookies()}
         headers = {"user-agent": page.evaluate("navigator.userAgent")}
 
-    with _session_store["lock"]:
-        _session_store["sessions"][domain] = {"cookies": cookies, "headers": headers}
-    log.info("[stealth] Session stored for %s.", domain)
+    d = _domain(parsed.netloc)
+    d.cookies, d.headers = cookies, headers
+    log.info("[stealth] Session stored for %s.", parsed.netloc)
 
 
 def _fetch_via_stealth(url, use_root=True, seen_cookies=None):
-    """
-    Acquire per-domain lock and run stealth if no session exists yet.
-    If another thread already refreshed the session while waiting,
-    skip the run entirely. use_root=False forces a run against the url itself
-    (for pages that challenge even when the homepage doesn't).
-
-    seen_cookies is the session the caller already failed with. If the stored
-    session has moved on, another thread solved it while we queued on the lock,
-    so we use theirs: a host whose root always challenges (kwik) falls through to
-    the use_root=False branch on every request, and without this each concurrent
-    caller launches its own browser and overwrites the last one's session.
-    """
-    domain = _get_domain(url)
-    lock = _get_stealth_lock(domain)
-
-    with lock:
-        _, cookies = _get_session(domain)
-        if cookies and (use_root or cookies != seen_cookies):
-            log.info("[stealth] %s session already refreshed, skipping run.", domain)
+    """Skip the run if another thread stored a session newer than `seen_cookies`
+    while this one queued on the lock."""
+    d = _domain(_get_domain(url))
+    with d.stealth_lock:
+        if d.cookies and (use_root or d.cookies != seen_cookies):
+            log.info("[stealth] %s session already refreshed, skipping run.", _get_domain(url))
             return
-
-        _clear_session(domain)
-        try:
-            _run_stealth(url, use_root=use_root)
-        except Exception as exc:
-            log.error("[stealth] Error for %s: %s", domain, exc)
-            raise
+        d.cookies, d.headers = {}, {}
+        _run_stealth(url, use_root=use_root)
 
 
 def _light_session(headers, cookies):
-    """
-    Impersonate Firefox so the TLS fingerprint matches the Camoufox UA and cookie;
-    Cloudflare fingerprints TLS, and a Chrome handshake under a Firefox UA stands out.
-    """
-    # socks5h resolves DNS at the proxy, matching Firefox; socks5 resolves locally and fails.
+    """Firefox impersonation: Cloudflare fingerprints TLS against the Camoufox UA.
+    socks5h resolves DNS at the proxy; socks5 resolves locally and fails."""
     curl_proxy = proxy.replace("socks5://", "socks5h://", 1) if proxy else None
     return curl.Session(
         impersonate="firefox", headers=headers, cookies=cookies, proxy=curl_proxy, timeout=30
@@ -258,11 +174,13 @@ def _fetch_via_session(url, headers, cookies, method="GET", data=None, follow=Tr
     body = r.content.decode("utf-8", errors="ignore")
     resp_headers = dict(r.headers)
     content_type = resp_headers.get("content-type", "")
-
     if _is_blocked(r.status_code, body):
         return None, content_type
 
-    parsed, is_json = _try_parse_json(body)
+    try:
+        data, is_json = json.loads(body), True
+    except ValueError:
+        data, is_json = body, False
     return {
         "success": True,
         "status_code": r.status_code,
@@ -270,73 +188,47 @@ def _fetch_via_session(url, headers, cookies, method="GET", data=None, follow=Tr
         "headers": resp_headers,
         "location": resp_headers.get("location"),
         "is_json": is_json,
-        "data": parsed if is_json else body,
+        "data": data,
     }, content_type
 
 
 def _stream_via_session(url, headers, cookies):
-    """Returns (flask_response_or_None, content_type_of_the_response)."""
+    """Returns (flask_response_or_None, content_type). None means blocked."""
     r = _light_session(headers, cookies).get(url, stream=True)
-
     content_type = r.headers.get("content-type", "application/octet-stream")
 
     stream = r.iter_content(chunk_size=8192)
     first_chunk = next(stream, b"")
-    preview = first_chunk.decode("utf-8", errors="ignore")
-
-    if _is_blocked(r.status_code, preview):
+    if _is_blocked(r.status_code, first_chunk.decode("utf-8", errors="ignore")):
         r.close()
         return None, content_type
 
     def generate():
         try:
             yield first_chunk
-            for chunk in stream:
-                if chunk:
-                    yield chunk
+            yield from (c for c in stream if c)
         finally:
-            r.close()  # also runs if the client disconnects mid-stream
+            r.close()
 
-    content_disposition = r.headers.get("content-disposition", "")
-
-    response = Response(
-        stream_with_context(generate()),
-        status=r.status_code,
-        content_type=content_type,
-    )
-    if content_disposition:
-        response.headers["Content-Disposition"] = content_disposition
-
+    response = Response(stream_with_context(generate()), status=r.status_code, content_type=content_type)
+    if disposition := r.headers.get("content-disposition"):
+        response.headers["Content-Disposition"] = disposition
     return response, content_type
 
 
-def _should_try_plain(key, has_session):
-    """Domains known to need stealth only get a plain attempt when cookies are cached."""
-    return _get_domain_status(key) is not False or has_session
-
-
 def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, tag=""):
-    """
-    Run `attempt(headers, cookies)` against progressively stronger sessions:
-    cached/plain -> stealth on the domain root -> stealth on the URL itself.
-
-    `attempt` returns (value, content_type); a value of None means blocked.
-    `target_stealth_ok(content_type)` gates the final escalation — return False
-    to skip pointing a browser at something it can't help with (e.g. a binary).
-
-    Returns (value, None) on success, or (None, error_message).
-    """
-    domain = _get_domain(url)
-    key = _get_status_key(url)
+    """Run `attempt(headers, cookies)` plain, then after stealth on the root, then on the URL.
+    `attempt` returns (value, content_type); None means blocked.
+    `target_stealth_ok(content_type)` gates the last step. Returns (value, error)."""
+    host, key = _get_domain(url), _get_status_key(url)
 
     def current_session():
-        headers, cookies = _get_session(domain)
+        d = _domain(host)
+        headers, cookies = d.headers.copy(), d.cookies.copy()
         if extra_headers:
             session_ua = headers.get("user-agent")
             headers.update(extra_headers)
-            if session_ua:
-                # cf_clearance is bound to the solving browser's UA, so a
-                # caller-supplied User-Agent must not override it.
+            if session_ua:  # cf_clearance is bound to the solving browser's UA
                 headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
                 headers["user-agent"] = session_ua
         return headers, cookies
@@ -351,16 +243,14 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
     headers, cookies = current_session()
     used_cached_session = bool(headers and cookies)
 
-    if _should_try_plain(key, used_cached_session):
+    if _domain(key).plain_works is not False or used_cached_session:
         value, _ = try_attempt("plain")
         if value is not None:
             log.info("[%s] Succeeded without stealth.", tag)
-            # Only a success without cached cookies proves the domain works plain.
             _set_domain_status(key, not used_cached_session)
             return value, None
 
     _set_domain_status(key, False)
-
     if _in_stealth_cooldown(key):
         log.info("[%s] %s in stealth cooldown, not launching a browser.", tag, key)
         return None, f"Blocked; stealth recently failed for {key}"
@@ -378,13 +268,11 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
         if value is not None:
             log.info("[%s] Succeeded after stealth on %s.", tag, where)
             return value, None
-
         if use_root and target_stealth_ok and not target_stealth_ok(content_type):
             log.info("[%s] Skipping target-URL stealth (%s).", tag, content_type)
             break
 
-    # Stealth couldn't get through; cool down to stop relaunching browsers.
-    _mark_stealth_failed(key)
+    _domain(key).stealth_failed_at = time.monotonic()
     return None, "Failed after stealth refresh"
 
 
@@ -392,30 +280,22 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
 def handle_fetch():
     body = request.get_json(silent=True, force=True) or {}
     url = body.get("url")
-
     if not url:
         return jsonify({"error": "Missing 'url' parameter"}), 400
-
-    if body.get("params") and isinstance(body["params"], dict):
+    if isinstance(body.get("params"), dict) and body["params"]:
         url = _build_url_with_params(url, body["params"])
 
-    extra_headers = body.get("headers") or {}
     method = (body.get("method") or "GET").upper()
     if method not in ("GET", "POST"):
         return jsonify({"error": f"Unsupported method: {method}"}), 400
 
-    req_opts = {
-        "method": method,
-        "data": body.get("data"),
-        "follow": body.get("follow_redirects", True),
-    }
-
     result, error = _with_escalation(
         url,
         lambda headers, cookies: _fetch_via_session(
-            url, headers, cookies, **req_opts
+            url, headers, cookies, method=method,
+            data=body.get("data"), follow=body.get("follow_redirects", True),
         ),
-        extra_headers=extra_headers,
+        extra_headers=body.get("headers") or {},
         tag="fetch",
     )
     if error:
@@ -426,10 +306,8 @@ def handle_fetch():
 @app.route("/api/download", methods=["GET"])
 def handle_download():
     url = request.args.get("url")
-
     if not url:
         return jsonify({"error": "Missing 'url' parameter"}), 400
-
     params = request.args.to_dict()
     params.pop("url", None)
     if params:
@@ -438,8 +316,6 @@ def handle_download():
     result, error = _with_escalation(
         url,
         lambda headers, cookies: _stream_via_session(url, headers, cookies),
-        # Pointing a browser at a multi-GB binary buys nothing and burns the
-        # domain lock for the full browser timeout.
         target_stealth_ok=lambda ctype: ctype.startswith("text/html"),
         tag="download",
     )
@@ -451,17 +327,19 @@ def handle_download():
 @app.route("/api/session", methods=["GET"])
 def handle_session():
     domain = request.args.get("domain")
-    with _session_store["lock"]:
-        if domain:
-            session = _session_store["sessions"].get(domain)
-            if not session:
-                return jsonify({"error": f"No session for {domain}"}), 404
-            return jsonify(session), 200
-        if not _session_store["sessions"]:
-            return jsonify({"error": "No sessions available yet"}), 404
-        return jsonify(_session_store["sessions"]), 200
+    with _lock:
+        sessions = {
+            k: {"cookies": d.cookies, "headers": d.headers}
+            for k, d in _domains.items() if d.cookies
+        }
+    if domain:
+        if domain not in sessions:
+            return jsonify({"error": f"No session for {domain}"}), 404
+        return jsonify(sessions[domain]), 200
+    if not sessions:
+        return jsonify({"error": "No sessions available yet"}), 404
+    return jsonify(sessions), 200
 
 
 if __name__ == "__main__":
-    debug = os.environ.get("FLASK_DEBUG") == "1"
-    app.run(host="0.0.0.0", port=5001, debug=debug, threaded=True)
+    app.run(host="0.0.0.0", port=5001, debug=os.environ.get("FLASK_DEBUG") == "1", threaded=True)
