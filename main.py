@@ -49,6 +49,14 @@ CLOUDFLARE_DOM_MARKERS = [
     'id="cf-please-wait"',
 ]
 
+# Cloudflare's JS-detection beacon. It ships with its 429 challenge, but it is
+# also injected into perfectly good 200 pages for fingerprinting, so on its own
+# it means nothing — only paired with an error status is it a real challenge.
+CLOUDFLARE_ERROR_DOM_MARKERS = [
+    "/cdn-cgi/challenge-platform/",
+    "__cf$cv$params",
+]
+
 
 def _get_domain(url):
     return urlparse(url).netloc
@@ -131,6 +139,10 @@ def _is_blocked(status_code, body):
     lower = (body or "").lower()
     if any(marker in lower for marker in CLOUDFLARE_DOM_MARKERS):
         return True
+    if status_code >= 400 and any(
+        marker in lower for marker in CLOUDFLARE_ERROR_DOM_MARKERS
+    ):
+        return True
     return status_code in CLOUDFLARE_STATUS_CODES
 
 
@@ -195,20 +207,26 @@ def _run_stealth(url, use_root=True):
     log.info("[stealth] Session stored for %s.", domain)
 
 
-def _fetch_via_stealth(url, use_root=True):
+def _fetch_via_stealth(url, use_root=True, seen_cookies=None):
     """
     Acquire per-domain lock and run stealth if no session exists yet.
     If another thread already refreshed the session while waiting,
     skip the run entirely. use_root=False forces a run against the url itself
     (for pages that challenge even when the homepage doesn't).
+
+    seen_cookies is the session the caller already failed with. If the stored
+    session has moved on, another thread solved it while we queued on the lock,
+    so we use theirs: a host whose root always challenges (kwik) falls through to
+    the use_root=False branch on every request, and without this each concurrent
+    caller launches its own browser and overwrites the last one's session.
     """
     domain = _get_domain(url)
     lock = _get_stealth_lock(domain)
 
     with lock:
         _, cookies = _get_session(domain)
-        if cookies and use_root:
-            log.info("[stealth] %s session already ready, skipping run.", domain)
+        if cookies and (use_root or cookies != seen_cookies):
+            log.info("[stealth] %s session already refreshed, skipping run.", domain)
             return
 
         _clear_session(domain)
@@ -350,11 +368,12 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
     for use_root in (True, False):
         where = "domain root" if use_root else "target URL"
         try:
-            _fetch_via_stealth(url, use_root=use_root)
+            _fetch_via_stealth(url, use_root=use_root, seen_cookies=cookies)
         except Exception as exc:
             log.warning("[%s] Stealth on %s failed: %s", tag, where, exc)
             continue
 
+        headers, cookies = current_session()
         value, content_type = try_attempt(f"after stealth on {where}")
         if value is not None:
             log.info("[%s] Succeeded after stealth on %s.", tag, where)
