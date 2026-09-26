@@ -23,8 +23,10 @@ STEALTH_COOLDOWN_S = int(os.environ.get("STEALTH_COOLDOWN_S", "900"))
 CHALLENGE_WAIT_S = int(os.environ.get("CHALLENGE_WAIT_S", "30"))
 
 CLOUDFLARE_STATUS_CODES = {503}
+# Language-independent only: the interstitial is served in the egress IP's language,
+# so its title is not a marker. _cf_chl_opt is emitted by the challenge page alone.
 CLOUDFLARE_DOM_MARKERS = [
-    "<title>just a moment...</title>",
+    "_cf_chl_opt",
     'id="cf-challenge-form"',
     "cf-browser-verification",
     'id="challenge-running"',
@@ -122,11 +124,18 @@ def _run_stealth(url, use_root=True):
         headless=True, humanize=True, os="windows", geoip=True, proxy=_camoufox_proxy()
     ) as browser:
         page = browser.new_page()
+        nav = {"status": 200}
+
+        def _note(resp):
+            if resp.request.is_navigation_request() and resp.frame is page.main_frame:
+                nav["status"] = resp.status
+
+        page.on("response", _note)
         page.goto(root_url, wait_until="domcontentloaded")
 
         def challenged():
             try:
-                return _is_blocked(200, page.content())
+                return _is_blocked(nav["status"], page.content())
             except Exception:  # page.content() raises mid-redirect
                 return True
 
@@ -150,7 +159,10 @@ def _fetch_via_stealth(url, use_root=True, seen_cookies=None):
     d = _domain(_get_domain(url))
     with d.stealth_lock:
         if d.cookies and (use_root or d.cookies != seen_cookies):
-            log.info("[stealth] %s session already refreshed, skipping run.", _get_domain(url))
+            log.info(
+                "[stealth] %s session already refreshed, skipping run.",
+                _get_domain(url),
+            )
             return
         d.cookies, d.headers = {}, {}
         _run_stealth(url, use_root=use_root)
@@ -161,7 +173,11 @@ def _light_session(headers, cookies):
     socks5h resolves DNS at the proxy; socks5 resolves locally and fails."""
     curl_proxy = proxy.replace("socks5://", "socks5h://", 1) if proxy else None
     return curl.Session(
-        impersonate="firefox", headers=headers, cookies=cookies, proxy=curl_proxy, timeout=30
+        impersonate="firefox",
+        headers=headers,
+        cookies=cookies,
+        proxy=curl_proxy,
+        timeout=30,
     )
 
 
@@ -210,7 +226,9 @@ def _stream_via_session(url, headers, cookies):
         finally:
             r.close()
 
-    response = Response(stream_with_context(generate()), status=r.status_code, content_type=content_type)
+    response = Response(
+        stream_with_context(generate()), status=r.status_code, content_type=content_type
+    )
     if disposition := r.headers.get("content-disposition"):
         response.headers["Content-Disposition"] = disposition
     return response, content_type
@@ -229,7 +247,9 @@ def _with_escalation(url, attempt, extra_headers=None, target_stealth_ok=None, t
             session_ua = headers.get("user-agent")
             headers.update(extra_headers)
             if session_ua:  # cf_clearance is bound to the solving browser's UA
-                headers = {k: v for k, v in headers.items() if k.lower() != "user-agent"}
+                headers = {
+                    k: v for k, v in headers.items() if k.lower() != "user-agent"
+                }
                 headers["user-agent"] = session_ua
         return headers, cookies
 
@@ -292,8 +312,12 @@ def handle_fetch():
     result, error = _with_escalation(
         url,
         lambda headers, cookies: _fetch_via_session(
-            url, headers, cookies, method=method,
-            data=body.get("data"), follow=body.get("follow_redirects", True),
+            url,
+            headers,
+            cookies,
+            method=method,
+            data=body.get("data"),
+            follow=body.get("follow_redirects", True),
         ),
         extra_headers=body.get("headers") or {},
         tag="fetch",
@@ -330,7 +354,8 @@ def handle_session():
     with _lock:
         sessions = {
             k: {"cookies": d.cookies, "headers": d.headers}
-            for k, d in _domains.items() if d.cookies
+            for k, d in _domains.items()
+            if d.cookies
         }
     if domain:
         if domain not in sessions:
@@ -342,4 +367,9 @@ def handle_session():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5001, debug=os.environ.get("FLASK_DEBUG") == "1", threaded=True)
+    app.run(
+        host="0.0.0.0",
+        port=5001,
+        debug=os.environ.get("FLASK_DEBUG") == "1",
+        threaded=True,
+    )
