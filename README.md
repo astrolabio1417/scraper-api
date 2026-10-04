@@ -10,26 +10,31 @@ Small Flask API that fetches pages through a normal HTTP session first and falls
 - Per-domain in-memory session cache for headers and cookies
 - Cloudflare-aware fallback using Camoufox (stealth Firefox) and `curl_cffi` TLS impersonation
 
-## Requirements
+## Layout
 
-- Python 3.12+
-- Flask
-- curl_cffi
-- camoufox
+| File | Role |
+|---|---|
+| `app.py` | Flask routes. Parses and validates input, delegates, serialises. |
+| `escalation.py` | `FetchRequest` and the plain → root stealth → target stealth policy. |
+| `transport.py` | curl_cffi requests and the Camoufox stealth run. |
+| `sessions.py` | `SessionStore`: per-domain cookies, verdicts and cooldowns. |
+| `cloudflare.py` | Challenge detection. Stdlib only. |
+
+Each module depends only on the ones below it.
 
 ## Run Locally
 
 Install dependencies:
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt pytest ruff
 python -m camoufox fetch
 ```
 
 Start the API:
 
 ```bash
-python main.py
+python app.py
 ```
 
 The server listens on `http://0.0.0.0:5001`.
@@ -37,7 +42,13 @@ The server listens on `http://0.0.0.0:5001`.
 You can enable Flask debug mode with:
 
 ```bash
-FLASK_DEBUG=1 python main.py
+FLASK_DEBUG=1 python app.py
+```
+
+Run the checks:
+
+```bash
+ruff check . && pytest -q
 ```
 
 ## Run With Docker
