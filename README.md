@@ -8,7 +8,7 @@ Small Flask API that fetches pages through a normal HTTP session first and falls
 - `GET /api/download` for streaming a remote file or response body
 - `GET /api/session` for inspecting cached sessions by domain
 - Per-domain in-memory session cache for headers and cookies
-- Cloudflare-aware fallback using Camoufox (stealth Firefox) and `curl_cffi` TLS impersonation
+- Cloudflare-aware fallback using Scrapling's `StealthySession` (stealth Chromium) and `curl_cffi` TLS impersonation
 
 ## Layout
 
@@ -16,7 +16,7 @@ Small Flask API that fetches pages through a normal HTTP session first and falls
 |---|---|
 | `app.py` | Flask routes. Parses and validates input, delegates, serialises. |
 | `escalation.py` | `FetchRequest` and the plain → root stealth → target stealth policy. |
-| `transport.py` | curl_cffi requests and the Camoufox stealth run. |
+| `transport.py` | curl_cffi requests and the Scrapling stealth run. |
 | `sessions.py` | `SessionStore`: per-domain cookies, verdicts and cooldowns. |
 | `cloudflare.py` | Challenge detection. Stdlib only. |
 
@@ -28,7 +28,7 @@ Install dependencies:
 
 ```bash
 pip install -r requirements.txt pytest ruff
-python -m camoufox fetch
+scrapling install
 ```
 
 Start the API:
@@ -131,5 +131,5 @@ curl "http://localhost:5001/api/session?domain=example.com"
 ## Notes
 
 - Session data is stored in memory only and is lost when the process restarts.
-- The stealth fallback may launch a headless Firefox and take longer than a normal request.
+- The stealth fallback may launch a headless Chromium and take longer than a normal request.
 - The API is intended for scraping-friendly use cases where some targets require browser-based challenge solving.
