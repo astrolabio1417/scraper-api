@@ -1,12 +1,10 @@
 import json
 import logging
 import os
-import time
-from urllib.parse import urlparse
 
-from camoufox.sync_api import Camoufox
 from curl_cffi import requests as curl
 from flask import Response, stream_with_context
+from scrapling.fetchers import StealthySession
 
 from cloudflare import is_blocked
 from sessions import host
@@ -20,22 +18,12 @@ class TransportError(Exception):
     """Nothing answered: dead proxy, dns or timeout. Never a block."""
 
 
-def _camoufox_proxy():
-    if not proxy:
-        return None
-    u = urlparse(proxy)
-    out = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
-    if u.username:
-        out["username"], out["password"] = u.username, u.password or ""
-    return out
-
-
 def light_session(headers, cookies):
-    """Firefox impersonation: Cloudflare fingerprints TLS against the Camoufox UA.
+    """Chrome impersonation: Cloudflare fingerprints TLS against the stealth browser's UA.
     socks5h resolves DNS at the proxy; socks5 resolves locally and fails."""
     curl_proxy = proxy.replace("socks5://", "socks5h://", 1) if proxy else None
     return curl.Session(
-        impersonate="firefox",
+        impersonate="chrome",
         headers=headers,
         cookies=cookies,
         proxy=curl_proxy,
@@ -105,38 +93,17 @@ def stream(url, headers, cookies):
 
 
 def run_stealth(url):
-    """Returns (cookies, headers). geoip=True: Turnstile fails when locale/timezone
-    mismatch the egress IP. The UA is returned because cf_clearance is bound to it.
+    """Returns (cookies, headers). The UA is returned because cf_clearance is bound to it.
     An unchallenged page yields a jar with no clearance in it."""
     log.info("[stealth] Starting run on %s.", url)
-    with Camoufox(
-        headless=True, humanize=True, os="windows", geoip=True, proxy=_camoufox_proxy()
+    with StealthySession(
+        headless=True, solve_cloudflare=True, proxy=proxy, timeout=CHALLENGE_WAIT_S * 1000
     ) as browser:
-        page = browser.new_page()
-        nav = {"status": 200}
-
-        def _note(resp):
-            if resp.request.is_navigation_request() and resp.frame is page.main_frame:
-                nav["status"] = resp.status
-
-        page.on("response", _note)
-        page.goto(url, wait_until="domcontentloaded")
-
-        def challenged():
-            try:
-                return is_blocked(nav["status"], page.content())
-            except Exception:  # page.content() raises mid-redirect
-                return True
-
-        deadline = time.monotonic() + CHALLENGE_WAIT_S
-        while challenged() and time.monotonic() < deadline:
-            time.sleep(1)
-        if challenged():
-            raise RuntimeError(f"challenge still present on {url}")
-
-        cookies = {c["name"]: str(c["value"]) for c in page.context.cookies()}
-        headers = {"user-agent": page.evaluate("navigator.userAgent")}
-    return cookies, headers
+        page = browser.fetch(url)
+    if is_blocked(page.status, page.body.decode("utf-8", errors="ignore")):
+        raise RuntimeError(f"challenge still present on {url}")
+    cookies = {c["name"]: str(c["value"]) for c in page.cookies}
+    return cookies, {"user-agent": page.request_headers["user-agent"]}
 
 
 def refresh_session(store, url, seen_cookies=None):

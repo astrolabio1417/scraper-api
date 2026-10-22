@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 import app as app_module
@@ -16,45 +18,14 @@ def client():
 
 
 @pytest.fixture
-def fake_camoufox(monkeypatch):
+def fake_stealth(monkeypatch):
     """Returns a factory: fake(html, cookies, status) -> list of visited urls."""
     import transport
 
     def fake(html, cookies, status=200):
         visited = []
 
-        class Ctx:
-            def cookies(self):
-                return cookies
-
-        class Req:
-            def is_navigation_request(self):
-                return True
-
-        class Page:
-            context = Ctx()
-            main_frame = object()
-
-            def __init__(self):
-                self._handlers = []
-
-            def on(self, event, fn):
-                self._handlers.append(fn)
-
-            def goto(self, url, *a, **k):
-                visited.append(url)
-                resp = type("Resp", (), {"status": status, "request": Req()})()
-                resp.frame = self.main_frame
-                for fn in self._handlers:
-                    fn(resp)
-
-            def content(self):
-                return html
-
-            def evaluate(self, js):
-                return "Firefox/152.0"
-
-        class Browser:
+        class Session:
             def __init__(self, **k):
                 pass
 
@@ -64,11 +35,16 @@ def fake_camoufox(monkeypatch):
             def __exit__(self, *a):
                 pass
 
-            def new_page(self):
-                return Page()
+            def fetch(self, url, **k):
+                visited.append(url)
+                return SimpleNamespace(
+                    status=status,
+                    body=html.encode(),
+                    cookies=tuple(cookies),
+                    request_headers={"user-agent": "Chrome/150.0"},
+                )
 
-        monkeypatch.setattr(transport, "Camoufox", Browser)
-        monkeypatch.setattr(transport, "CHALLENGE_WAIT_S", 0)
+        monkeypatch.setattr(transport, "StealthySession", Session)
         return visited
 
     return fake
