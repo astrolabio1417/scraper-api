@@ -97,7 +97,11 @@ def run_stealth(url):
     An unchallenged page yields a jar with no clearance in it."""
     log.info("[stealth] Starting run on %s.", url)
     with StealthySession(
-        headless=True, solve_cloudflare=True, proxy=proxy, timeout=CHALLENGE_WAIT_S * 1000
+        headless=True,
+        solve_cloudflare=True,
+        proxy=proxy,
+        google_search=False,
+        timeout=CHALLENGE_WAIT_S * 1000,
     ) as browser:
         page = browser.fetch(url)
     if is_blocked(page.status, page.body.decode("utf-8", errors="ignore")):
