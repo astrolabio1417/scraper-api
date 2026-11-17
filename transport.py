@@ -1,6 +1,8 @@
 import json
 import logging
 import os
+import socket
+from urllib.parse import urlsplit
 
 from curl_cffi import requests as curl
 from flask import Response, stream_with_context
@@ -92,6 +94,14 @@ def stream(url, headers, cookies):
     return response, content_type
 
 
+def browser_proxy():
+    """Chromium rejects a proxy host ending in a number (px.web.1), so hand it the IP."""
+    host = urlsplit(proxy or "").hostname or ""
+    if not host.rsplit(".", 1)[-1].isdigit():
+        return proxy
+    return proxy.replace(host, socket.gethostbyname(host), 1)
+
+
 def run_stealth(url):
     """Returns (cookies, headers). The UA is returned because cf_clearance is bound to it.
     An unchallenged page yields a jar with no clearance in it."""
@@ -99,7 +109,7 @@ def run_stealth(url):
     with StealthySession(
         headless=True,
         solve_cloudflare=True,
-        proxy=proxy,
+        proxy=browser_proxy(),
         google_search=False,
         timeout=CHALLENGE_WAIT_S * 1000,
     ) as browser:

@@ -74,3 +74,19 @@ def test_stealth_opens_exactly_the_url_it_is_given(fake_stealth):
     visited = fake_stealth("<html>ok</html>", [{"name": "cf_clearance", "value": "x"}])
     run_stealth("https://host-a.example/f/abc")
     assert visited == ["https://host-a.example/f/abc"]
+
+
+def test_browser_proxy_hands_chromium_an_ip(monkeypatch):
+    monkeypatch.setattr(transport, "proxy", None)
+    assert transport.browser_proxy() is None
+
+    monkeypatch.setattr(transport, "proxy", "socks5://px.web.1:1080")
+    monkeypatch.setattr(transport.socket, "gethostbyname", lambda h: "10.0.0.7")
+    assert transport.browser_proxy() == "socks5://10.0.0.7:1080"
+
+    monkeypatch.setattr(transport, "proxy", "http://u:p@px.web.1:8080")
+    assert transport.browser_proxy() == "http://u:p@10.0.0.7:8080"
+
+    for untouched in ["socks5://px.example:1080", "http://[::1]:8080", "px.web.1:1080"]:
+        monkeypatch.setattr(transport, "proxy", untouched)
+        assert transport.browser_proxy() == untouched
