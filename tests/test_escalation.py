@@ -106,6 +106,30 @@ def test_download_style_gate_skips_target_stealth_for_non_html(monkeypatch):
     assert len(ran) == 1, "the root run is fine; the browser must not open the binary"
 
 
+def test_an_expired_jar_is_re_solved_on_the_root(monkeypatch):
+    """The root pass used to accept the very jar that just failed, so it retried
+    the expired cookies and left the solve to the target url."""
+    store = SessionStore()
+    d = store.get("walled.example")
+    d.cookies, d.headers = {"cf_clearance": "expired"}, {"user-agent": "ua"}
+    visited, attempts = [], []
+
+    def solve(url):
+        visited.append(url)
+        return {"cf_clearance": "fresh"}, {"user-agent": "ua"}
+
+    def attempt(headers, cookies):
+        attempts.append(cookies["cf_clearance"])
+        return ok() if cookies["cf_clearance"] == "fresh" else (None, "text/html")
+
+    monkeypatch.setattr(transport, "run_stealth", solve)
+    value, err = with_escalation(store, FetchRequest(url="https://walled.example/api/x"), attempt)
+
+    assert err is None and value["status_code"] == 200
+    assert visited == ["https://walled.example/"]
+    assert attempts == ["expired", "fresh"]
+
+
 @pytest.mark.parametrize(
     "body, message",
     [

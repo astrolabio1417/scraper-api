@@ -116,10 +116,9 @@ def with_escalation(store, req, attempt, target_stealth_ok=None, tag=""):
     passes = [req.challenge_url] if req.challenge_url else [root, req.url]
 
     for visit in passes:
-        # The root pass reuses any stored jar; later passes only one newer than they failed with.
-        stale = None if visit is root else seen
+        # Every pass reuses only a jar newer than the one it failed with.
         try:
-            transport.refresh_session(store, visit, seen_cookies=stale)
+            transport.refresh_session(store, visit, seen_cookies=seen)
         except Exception as exc:
             log.warning("[%s] Stealth on %s failed: %s", tag, visit, exc)
             continue
