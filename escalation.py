@@ -103,6 +103,8 @@ def with_escalation(store, req, attempt, target_stealth_ok=None, tag=""):
         if value is not None:
             log.info("[%s] Succeeded without stealth.", tag)
             store.set_status(key, not used_cached_session)
+            if used_cached_session:
+                transport.renew_if_aging(store, req.url)
             return value, None
 
     store.set_status(key, False)

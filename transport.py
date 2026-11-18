@@ -2,6 +2,8 @@ import json
 import logging
 import os
 import socket
+import threading
+import time
 from urllib.parse import urlsplit
 
 from curl_cffi import requests as curl
@@ -14,6 +16,18 @@ from sessions import host
 log = logging.getLogger("scraper")
 proxy = os.environ.get("proxy")
 CHALLENGE_WAIT_S = int(os.environ.get("CHALLENGE_WAIT_S", "30"))
+# a challenge page polls forever, so an uncapped idle wait burned the whole timeout per click
+SOLVE_IDLE_MS = int(os.environ.get("SOLVE_IDLE_MS", "5000"))
+# re-solve a jar this old in the background, before the site's clearance lapses (~15 min seen)
+RENEW_AFTER_S = int(os.environ.get("RENEW_AFTER_S", "600"))
+
+
+class IdleCappedSession(StealthySession):
+    """StealthySession whose network-idle waits give up after SOLVE_IDLE_MS."""
+
+    @staticmethod
+    def _wait_for_networkidle(page, timeout=None):
+        StealthySession._wait_for_networkidle(page, min(timeout or SOLVE_IDLE_MS, SOLVE_IDLE_MS))
 
 
 class TransportError(Exception):
@@ -106,7 +120,7 @@ def run_stealth(url):
     """Returns (cookies, headers). The UA is returned because cf_clearance is bound to it.
     An unchallenged page yields a jar with no clearance in it."""
     log.info("[stealth] Starting run on %s.", url)
-    with StealthySession(
+    with IdleCappedSession(
         headless=True,
         solve_cloudflare=True,
         proxy=browser_proxy(),
@@ -132,4 +146,36 @@ def refresh_session(store, url, seen_cookies=None):
             return
         d.cookies, d.headers = {}, {}
         d.cookies, d.headers = run_stealth(url)
+        d.solved_at = time.monotonic()
         log.info("[stealth] Session stored for %s.", name)
+
+
+def renew_if_aging(store, url):
+    """Start a background re-solve of url's host once its jar is RENEW_AFTER_S old.
+
+    The old jar keeps serving until a new one with a clearance replaces it, so
+    no caller waits on the browser. Returns the thread, or None."""
+    name = host(url)
+    d = store.get(name)
+    if d.solved_at is None or time.monotonic() - d.solved_at < RENEW_AFTER_S:
+        return None
+    if not d.stealth_lock.acquire(blocking=False):
+        return None
+    # one try per window: a failed renewal falls back to the normal escalation on expiry
+    d.solved_at = time.monotonic()
+    root = f"{urlsplit(url).scheme}://{name}/"
+    thread = threading.Thread(target=_renew, args=(d, root, name), daemon=True)
+    thread.start()
+    return thread
+
+
+def _renew(d, root, name):
+    try:
+        cookies, headers = run_stealth(root)
+        if "cf_clearance" in cookies:
+            d.cookies, d.headers = cookies, headers
+            log.info("[stealth] Session renewed for %s.", name)
+    except Exception as exc:
+        log.warning("[stealth] Renewal on %s failed: %s", root, exc)
+    finally:
+        d.stealth_lock.release()

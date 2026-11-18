@@ -1,3 +1,7 @@
+import threading
+import time
+from types import SimpleNamespace
+
 import pytest
 
 import transport
@@ -90,3 +94,58 @@ def test_browser_proxy_hands_chromium_an_ip(monkeypatch):
     for untouched in ["socks5://px.example:1080", "http://[::1]:8080", "px.web.1:1080"]:
         monkeypatch.setattr(transport, "proxy", untouched)
         assert transport.browser_proxy() == untouched
+
+
+def test_idle_cap_reaches_scraplings_own_wait():
+    """The override shadows a private scrapling method; an upgrade that renames it
+    would silently bring the full-timeout wait back."""
+    from scrapling.fetchers import StealthySession
+
+    assert hasattr(StealthySession, "_wait_for_networkidle")
+    waits = []
+    page = SimpleNamespace(wait_for_load_state=lambda state, timeout: waits.append(timeout))
+    for asked in (None, 30000, 2000):
+        transport.IdleCappedSession._wait_for_networkidle(page, asked)
+    assert waits == [5000, 5000, 2000]
+
+
+def aged_jar(store, age):
+    d = store.get("walled.example")
+    d.cookies, d.headers = {"cf_clearance": "old"}, {"user-agent": "ua-old"}
+    d.solved_at = time.monotonic() - age
+    return d
+
+
+def test_an_aging_jar_is_renewed_while_the_old_one_keeps_serving(monkeypatch):
+    store = SessionStore()
+    d = aged_jar(store, transport.RENEW_AFTER_S + 1)
+    release = threading.Event()
+
+    def solve(url):
+        assert d.cookies == {"cf_clearance": "old"}, "callers keep the old jar meanwhile"
+        release.wait(2)
+        return {"cf_clearance": "new"}, {"user-agent": "ua-new"}
+
+    monkeypatch.setattr(transport, "run_stealth", solve)
+    thread = transport.renew_if_aging(store, "https://walled.example/api?q=1")
+    assert transport.renew_if_aging(store, "https://walled.example/x") is None, "one at a time"
+    release.set()
+    thread.join(2)
+    assert (d.cookies, d.headers) == ({"cf_clearance": "new"}, {"user-agent": "ua-new"})
+    assert not d.stealth_lock.locked()
+
+
+def test_a_fresh_jar_is_left_alone(monkeypatch):
+    store = SessionStore()
+    aged_jar(store, 5)
+    monkeypatch.setattr(transport, "run_stealth", lambda url: pytest.fail("no renewal"))
+    assert transport.renew_if_aging(store, "https://walled.example/") is None
+
+
+def test_a_renewal_without_clearance_keeps_the_old_jar(monkeypatch):
+    store = SessionStore()
+    d = aged_jar(store, transport.RENEW_AFTER_S + 1)
+    monkeypatch.setattr(transport, "run_stealth", lambda url: ({"other": "x"}, {}))
+    transport.renew_if_aging(store, "https://walled.example/").join(2)
+    assert d.cookies == {"cf_clearance": "old"}
+    assert not d.stealth_lock.locked()

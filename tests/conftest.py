@@ -44,7 +44,7 @@ def fake_stealth(monkeypatch):
                     request_headers={"user-agent": "Chrome/150.0"},
                 )
 
-        monkeypatch.setattr(transport, "StealthySession", Session)
+        monkeypatch.setattr(transport, "IdleCappedSession", Session)
         return visited
 
     return fake

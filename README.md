@@ -126,6 +126,8 @@ curl "http://localhost:5001/api/session?domain=example.com"
 | `proxy` | unset | Proxy URL for both paths, e.g. `socks5://user:pass@host:1080` |
 | `STEALTH_COOLDOWN_S` | `900` | Seconds to stop launching browsers at a domain after stealth failed |
 | `CHALLENGE_WAIT_S` | `30` | Seconds to wait for a challenge to clear in the browser |
+| `SOLVE_IDLE_MS` | `5000` | Cap on each network-idle wait during a solve; a challenge page never goes idle |
+| `RENEW_AFTER_S` | `600` | Age at which a solved session is re-solved in the background; keep it under the site's clearance lifetime |
 | `LOG_LEVEL` | `INFO` | Python logging level |
 
 ## Notes
