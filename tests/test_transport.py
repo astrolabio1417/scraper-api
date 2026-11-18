@@ -113,6 +113,7 @@ def aged_jar(store, age):
     d = store.get("walled.example")
     d.cookies, d.headers = {"cf_clearance": "old"}, {"user-agent": "ua-old"}
     d.solved_at = time.monotonic() - age
+    d.solved_url = "https://walled.example/challenge"
     return d
 
 
@@ -122,6 +123,7 @@ def test_an_aging_jar_is_renewed_while_the_old_one_keeps_serving(monkeypatch):
     release = threading.Event()
 
     def solve(url):
+        assert url == "https://walled.example/challenge", "revisits the url that solved"
         assert d.cookies == {"cf_clearance": "old"}, "callers keep the old jar meanwhile"
         release.wait(2)
         return {"cf_clearance": "new"}, {"user-agent": "ua-new"}
@@ -149,3 +151,18 @@ def test_a_renewal_without_clearance_keeps_the_old_jar(monkeypatch):
     transport.renew_if_aging(store, "https://walled.example/").join(2)
     assert d.cookies == {"cf_clearance": "old"}
     assert not d.stealth_lock.locked()
+
+
+def test_a_jar_without_clearance_is_never_renewed(monkeypatch):
+    store = SessionStore()
+    d = aged_jar(store, transport.RENEW_AFTER_S + 1)
+    d.cookies = {"__cf_bm": "bm"}
+    monkeypatch.setattr(transport, "run_stealth", lambda url: pytest.fail("no renewal"))
+    assert transport.renew_if_aging(store, "https://walled.example/") is None
+
+
+def test_a_solve_records_its_url(monkeypatch):
+    store = SessionStore()
+    monkeypatch.setattr(transport, "run_stealth", lambda url: ({"cf_clearance": "c"}, {}))
+    transport.refresh_session(store, "https://walled.example/challenge")
+    assert store.get("walled.example").solved_url == "https://walled.example/challenge"

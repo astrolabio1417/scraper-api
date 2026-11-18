@@ -19,6 +19,7 @@ class Domain:
     plain_works: bool | None = None
     stealth_failed_at: float | None = None
     solved_at: float | None = None
+    solved_url: str | None = None
     stealth_lock: threading.Lock = field(default_factory=threading.Lock)
 
 

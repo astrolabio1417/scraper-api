@@ -146,36 +146,39 @@ def refresh_session(store, url, seen_cookies=None):
             return
         d.cookies, d.headers = {}, {}
         d.cookies, d.headers = run_stealth(url)
-        d.solved_at = time.monotonic()
+        d.solved_at, d.solved_url = time.monotonic(), url
         log.info("[stealth] Session stored for %s.", name)
 
 
 def renew_if_aging(store, url):
     """Start a background re-solve of url's host once its jar is RENEW_AFTER_S old.
 
-    The old jar keeps serving until a new one with a clearance replaces it, so
-    no caller waits on the browser. Returns the thread, or None."""
+    The re-solve revisits the url that produced the jar, since the host root may
+    carry no challenge. A jar without a clearance is never renewed. The old jar
+    keeps serving until a new one with a clearance replaces it, so no caller
+    waits on the browser. Returns the thread, or None."""
     name = host(url)
     d = store.get(name)
-    if d.solved_at is None or time.monotonic() - d.solved_at < RENEW_AFTER_S:
+    if "cf_clearance" not in d.cookies or d.solved_url is None:
+        return None
+    if time.monotonic() - d.solved_at < RENEW_AFTER_S:
         return None
     if not d.stealth_lock.acquire(blocking=False):
         return None
     # one try per window: a failed renewal falls back to the normal escalation on expiry
     d.solved_at = time.monotonic()
-    root = f"{urlsplit(url).scheme}://{name}/"
-    thread = threading.Thread(target=_renew, args=(d, root, name), daemon=True)
+    thread = threading.Thread(target=_renew, args=(d, d.solved_url, name), daemon=True)
     thread.start()
     return thread
 
 
-def _renew(d, root, name):
+def _renew(d, url, name):
     try:
-        cookies, headers = run_stealth(root)
+        cookies, headers = run_stealth(url)
         if "cf_clearance" in cookies:
             d.cookies, d.headers = cookies, headers
             log.info("[stealth] Session renewed for %s.", name)
     except Exception as exc:
-        log.warning("[stealth] Renewal on %s failed: %s", root, exc)
+        log.warning("[stealth] Renewal on %s failed: %s", url, exc)
     finally:
         d.stealth_lock.release()
